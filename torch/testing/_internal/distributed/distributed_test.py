@@ -26,7 +26,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel.distributed import _dump_DDP_relevant_env_vars
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.distributed_c10d import _get_default_group, AllreduceOptions, GroupMember
+from torch.nn.parallel import DistributedDataParallel
+from torch.distributed.distributed_c10d import get_world_size, _get_default_group, AllreduceOptions, GroupMember
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     TEST_SKIPS,
@@ -46,6 +47,7 @@ from torch.testing._internal.common_distributed import (
 from torch._utils_internal import TEST_MASTER_ADDR as MASTER_ADDR
 from torch._utils_internal import TEST_MASTER_PORT as MASTER_PORT
 from torch.cuda.amp import GradScaler, autocast
+from test_c10d_common import gpus_for_rank
 
 try:
     import torchvision
@@ -3378,6 +3380,218 @@ class DistributedTest:
                 )
                 self._test_ddp_hook_parity(state=powersgd_state, hook=powerSGD.powerSGD_hook)
 
+        def _prepare_single_device_module(
+                self,
+                rank,
+                process_group,
+                devices,
+                device_ids,
+                global_batch_size,
+                gradient_as_bucket_view=False,
+        ):
+            model = Net()
+            device = devices[0] if devices else torch.device("cuda:%d" % rank)
+            ddp_model = DistributedDataParallel(
+                copy.deepcopy(model).to(device),
+                device_ids=device_ids,
+                process_group=process_group,
+                bucket_cap_mb=0.001,
+                gradient_as_bucket_view=gradient_as_bucket_view,
+            )
+
+            model.to(device)
+
+            input = torch.randn(global_batch_size, 2).to(device)
+            target = torch.randn(global_batch_size, 4).to(device)
+
+            return model, ddp_model, input, target
+
+        def _prepare_cpu_module(
+            self,
+            process_group,
+            global_batch_size,
+            gradient_as_bucket_view=False,
+        ):
+            model = Net()
+            ddp_model = DistributedDataParallel(
+                copy.deepcopy(model),
+                process_group=process_group,
+                bucket_cap_mb=0.001,
+                gradient_as_bucket_view=gradient_as_bucket_view,
+            )
+            input = torch.randn(global_batch_size, 2)
+            target = torch.randn(global_batch_size, 4)
+            return model, ddp_model, input, target
+
+        def _test_accumulate_gradients_no_sync(
+                self, num_iters=2, ddp_comm_hook=None, gradient_as_bucket_view=False
+        ):
+            """
+            This is the recommended way to implement accumulate grads.
+            If ``ddp_comm_hook`` input was specified, it will also register that hook
+            to the ``ddp_model``. The hook fed into this function should not change
+            the resulting gradients.
+            """
+            process_group = _get_default_group()
+            world_size = get_world_size()
+            rank = dist.get_rank()
+
+            if BACKEND == "mpi":
+                global_batch_size = world_size
+                local_batch_size = 1
+                model, ddp_model, input, target = self._prepare_cpu_module(
+                    process_group, global_batch_size, gradient_as_bucket_view
+                )
+
+            if BACKEND == "nccl":
+                int_devices = gpus_for_rank(world_size)[rank][:1]
+                devices = [torch.device("cuda:" + str(i)) for i in int_devices]
+                global_batch_size = world_size
+                local_batch_size = len(devices)
+                model, ddp_model, input, target = self._prepare_single_device_module(
+                    rank, process_group, devices, devices, global_batch_size, gradient_as_bucket_view
+                )
+
+            if ddp_comm_hook is not None:
+                ddp_model.register_comm_hook(process_group, ddp_comm_hook)
+
+            def step_model(model, input, target):
+                model.train()
+                output = model(input)
+                loss = F.mse_loss(output, target.to(output.device))
+                loss.backward()
+
+            # ensure accumulate grads works with no_grad => no grads are accumulated.
+            with torch.no_grad():
+                with ddp_model.no_sync():
+                    ddp_model.train()
+                    ddp_model(input)
+
+            # check two model parameters over num_iters iterations
+            for iteration in range(num_iters):
+                step_model(model, input, target)
+
+                ddp_input = input[
+                    rank * local_batch_size: (rank + 1) * local_batch_size
+                ]
+                ddp_target = target[
+                    rank * local_batch_size: (rank + 1) * local_batch_size
+                ]
+
+                if iteration % num_iters == 0:
+                    # accumulate grads locally
+                    with ddp_model.no_sync():
+                        step_model(ddp_model, ddp_input, ddp_target)
+                else:
+                    # sync grads
+                    step_model(ddp_model, ddp_input, ddp_target)
+
+                for i, j in zip(model.parameters(), ddp_model.parameters()):
+                    if not i.requires_grad:
+                        continue
+                    if iteration % num_iters == 0:
+                        self.assertNotEqual(i.grad, j.grad)
+                    else:
+                        self.assertEqual(i.grad, j.grad)
+
+
+                # Shuffle the input so that DDP input is different
+                torch.manual_seed(1337 + iteration)
+                input = input[torch.randperm(global_batch_size)]
+
+        @unittest.skipIf(
+            BACKEND != "mpi" and (BACKEND != 'nccl' or torch.cuda.device_count() < 2),
+            "get_future is only supported on mpi and nccl"
+        )
+        def test_accumulate_gradients_no_sync(self):
+            """
+            Runs _test_accumulate_gradients_no_sync using default inputs
+            """
+            self._test_accumulate_gradients_no_sync()
+
+        @unittest.skipIf(
+            BACKEND != "mpi" and (BACKEND != 'nccl' or torch.cuda.device_count() < 2),
+            "get_future is only supported on mpi and nccl"
+        )
+        def test_accumulate_gradients_no_sync_grad_is_view(self):
+            """
+            Runs _test_accumulate_gradients_no_sync using default inputs
+            """
+            self._test_accumulate_gradients_no_sync(gradient_as_bucket_view=True)
+
+        @unittest.skipIf(
+            BACKEND != "mpi" and (BACKEND != 'nccl' or torch.cuda.device_count() < 2),
+            "get_future is only supported on mpi and nccl"
+        )
+        def test_accumulate_gradients_no_sync_allreduce_hook(self):
+            """
+            Runs multiple iterations on _test_accumulate_gradients_no_sync
+            using allreduce hook and validates whether future result was properly
+            passed as gradients in reducer.
+            """
+
+            world_size = get_world_size()
+
+            def allreduce_hook(
+                    process_group: object, bucket: dist.GradBucket
+            ) -> torch._C.Future:
+                tensors = [bucket.get_tensor() / world_size]
+                return process_group.allreduce(tensors).get_future()
+
+            self._test_accumulate_gradients_no_sync(
+                num_iters=4, ddp_comm_hook=allreduce_hook
+            )
+
+        @unittest.skipIf(
+            BACKEND != "mpi" and (BACKEND != 'nccl' or torch.cuda.device_count() < 2),
+            "get_future is only supported on mpi and nccl"
+        )
+        def test_accumulate_gradients_no_sync_allreduce_with_then_hook(self):
+            """
+            Runs multiple iterations on _test_accumulate_gradients_no_sync using allreduce
+            hook that also uses then callbacks. In first then callback result is multiplied
+            by 2, and the second callback divides the result by 2 * world_size. It validates
+            whether final result was properly passed as gradients in reducer.
+            """
+
+            world_size = get_world_size()
+
+            def allreduce_with_then_hook(
+                    process_group: object, bucket: dist.GradBucket
+            ) -> torch.futures.Future:
+                fut = process_group.allreduce([bucket.get_tensor()]).get_future()
+
+                def mult(fut):
+                    # Multiply the result by 2.
+                    return [2 * t for t in fut.wait()]
+
+                def div(fut):
+                    # Divide the result by 2 * world_size.
+                    return [t / (2 * world_size) for t in fut.wait()]
+
+                return fut.then(mult).then(div)
+
+            self._test_accumulate_gradients_no_sync(
+                num_iters=4, ddp_comm_hook=allreduce_with_then_hook
+            )
+
+        @unittest.skipIf(
+            BACKEND != "mpi",
+            "get_future is only supported on mpi"
+        )
+        def test_get_future(self):
+            def mult(fut):
+                return [t * 3 for t in fut.wait()]
+
+            def add(fut):
+                return [t + 1 for t in fut.wait()]
+            group, group_id, rank = self._init_global_test()
+            input = _build_tensor(3, 2)
+            fut = group_id.allreduce([input]).get_future()
+            res = fut.then(mult).then(add).wait()
+            expected = _build_tensor(3, 2 * len(group) * 3 + 1)
+
+            self.assertEqual(res[0], expected)
 
         @unittest.skipIf(BACKEND != 'nccl' and BACKEND != 'gloo',
                          "Only Nccl & Gloo backend support DistributedDataParallel")
